@@ -1,5 +1,7 @@
 # mysql2bq
 
+> ⚠️ **WARNING: This is a Proof of Concept (POC) and not production-ready code. Use at your own risk.**
+
 A tool for Change Data Capture (CDC) from MySQL to BigQuery.
 
 ## Overview
