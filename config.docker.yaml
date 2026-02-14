@@ -1,0 +1,46 @@
+mysql:
+  host: mysql
+  port: 3306
+  user: replica
+  password: secret
+  server_id: 1001
+
+bigquery:
+  project: my-project
+  dataset: cdc_raw
+  # Optional: specify dataset location (e.g., "US", "EU")
+  # dataset_location: ""
+  # Optional: service account key JSON (can be file path or inline)
+  # service_account_key_json: ${file:./path-to-service-account.json}
+  # Alternatively, set GOOGLE_APPLICATION_CREDENTIALS environment variable
+  # export GOOGLE_APPLICATION_CREDENTIALS="/path/to/application_default_credentials.json"
+  # Optional: BigQuery API endpoint (useful for testing with emulator)
+  # endpoint: ""
+  # Optional: different project for BigQuery client operations
+  # client_project_id: ""
+
+cdc:
+  tables:
+    - db: app
+      table: users
+
+batching:
+  max_rows: 1000
+  max_delay: 2s
+  # Optional: maximum batch size in bytes (default: 5 MiB)
+  # max_bytes: 5242880
+  # Optional: batch timeout duration (default: 10s)
+  # timeout: 10s
+
+checkpoint:
+  type: file
+  path: ./checkpoint.json
+
+# Logging configuration
+logging:
+  level: info  # options: debug, info, warn, error
+  # file: ./logs/mysql2bq.log  # optional: log to file in addition to stdout
+
+# Optional: time partitioning for BigQuery tables
+# time_partitioning: none  # options: "none", "hour", "day", "month", "year"
+# time_partitioning_expiration: 0  # duration, e.g. "720h" (30 days)

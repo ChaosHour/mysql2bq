@@ -1,0 +1,17 @@
+[mysqld]
+# CDC Configuration
+server-id=1001
+log-bin=mysql-bin
+binlog-format=ROW
+binlog-row-image=FULL
+expire-logs-days=7
+max-binlog-size=100M
+
+# Performance settings for CDC
+innodb_buffer_pool_size=128M
+innodb_log_file_size=32M
+max_connections=100
+
+# Enable GTID (optional but recommended for production)
+gtid-mode=ON
+enforce-gtid-consistency=ON

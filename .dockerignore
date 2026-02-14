@@ -1,0 +1,38 @@
+# Binaries
+bin/
+mysql2bq
+
+# Logs
+logs/
+*.log
+
+# Checkpoints
+checkpoint.json
+
+# Git
+.git/
+.gitignore
+
+# Docker
+docker/
+docker-compose.yml
+Dockerfile
+
+# Documentation
+README.md
+LICENSE
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files
+*_test.go
+
+# Temporary files
+*.tmp
+*.swp

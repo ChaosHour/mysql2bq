@@ -1,0 +1,57 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: mysql2bq_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: app
+      MYSQL_USER: replica
+      MYSQL_PASSWORD: secret
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql/init:/docker-entrypoint-initdb.d
+      - ./docker/mysql/conf.d:/etc/mysql/conf.d
+    command: >
+      --server-id=1001
+      --log-bin=mysql-bin
+      --binlog-format=ROW
+      --binlog-row-image=FULL
+      --expire-logs-days=7
+      --max-binlog-size=100M
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p$$MYSQL_ROOT_PASSWORD"]
+      timeout: 20s
+      retries: 10
+    networks:
+      - mysql2bq_network
+
+  mysql2bq:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mysql2bq_app
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./config.docker.yaml:/app/config.yaml:ro
+      - ./checkpoint.json:/app/checkpoint.json
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/service-account.json
+    # Uncomment and mount your service account key if using file-based auth
+    # volumes:
+    #   - ./path/to/service-account.json:/app/service-account.json:ro
+    command: ["./mysql2bq", "start", "--config", "/app/config.yaml"]
+    networks:
+      - mysql2bq_network
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
+    driver: local
+
+networks:
+  mysql2bq_network:
+    driver: bridge
