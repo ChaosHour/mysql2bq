@@ -2,18 +2,22 @@ package pipeline
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
+	"github.com/ChaosHour/mysql2bq/internal/checkpoint"
 	"github.com/ChaosHour/mysql2bq/internal/config"
 	"github.com/ChaosHour/mysql2bq/internal/logging"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
+	_ "github.com/go-sql-driver/mysql"
 )
 
 type CDCReader struct {
-	cfg    *config.Config
-	logger *logging.Logger
+	cfg        *config.Config
+	logger     *logging.Logger
+	checkpoint checkpoint.Store
 }
 
 type CDCEvent struct {
@@ -28,9 +32,55 @@ type CDCEvent struct {
 
 func NewCDCReader(cfg *config.Config, logger *logging.Logger) *CDCReader {
 	return &CDCReader{
-		cfg:    cfg,
-		logger: logger,
+		cfg:        cfg,
+		logger:     logger,
+		checkpoint: checkpoint.NewFileStore(cfg.Checkpoint.Path),
 	}
+}
+
+// detectGTIDMode checks if MySQL is using GTID mode
+func (r *CDCReader) detectGTIDMode() (bool, error) {
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/mysql",
+		r.cfg.MySQL.User, r.cfg.MySQL.Password, r.cfg.MySQL.Host, r.cfg.MySQL.Port)
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return false, fmt.Errorf("failed to connect to MySQL: %w", err)
+	}
+	defer db.Close()
+
+	var gtidMode string
+	err = db.QueryRow("SELECT @@global.gtid_mode").Scan(&gtidMode)
+	if err != nil {
+		return false, fmt.Errorf("failed to query GTID mode: %w", err)
+	}
+
+	return gtidMode == "ON", nil
+}
+
+// getCurrentGTIDSet retrieves the current GTID set from MySQL
+func (r *CDCReader) getCurrentGTIDSet() (mysql.GTIDSet, error) {
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/mysql",
+		r.cfg.MySQL.User, r.cfg.MySQL.Password, r.cfg.MySQL.Host, r.cfg.MySQL.Port)
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to MySQL: %w", err)
+	}
+	defer db.Close()
+
+	var executedGTIDSet string
+	err = db.QueryRow("SELECT @@global.gtid_executed").Scan(&executedGTIDSet)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query executed GTID set: %w", err)
+	}
+
+	gtidSet, err := mysql.ParseGTIDSet("mysql", executedGTIDSet)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse GTID set: %w", err)
+	}
+
+	return gtidSet, nil
 }
 
 func (r *CDCReader) Start(ctx context.Context, eventChan chan<- *CDCEvent) error {
@@ -49,19 +99,74 @@ func (r *CDCReader) Start(ctx context.Context, eventChan chan<- *CDCEvent) error
 	// Create binlog syncer
 	syncer := replication.NewBinlogSyncer(cfg)
 
-	// Get current binlog position (for now, start from beginning)
-	// In production, this would come from checkpoint
-	pos := mysql.Position{
-		Name: "mysql-bin.000001", // This should be configurable or from checkpoint
-		Pos:  4,                  // Skip binlog header
+	// Detect GTID mode
+	gtidEnabled, err := r.detectGTIDMode()
+	if err != nil {
+		r.logger.Warn("Failed to detect GTID mode, falling back to position-based replication: %v", err)
+		gtidEnabled = false
 	}
 
-	r.logger.Info("Starting CDC from position: %s:%d", pos.Name, pos.Pos)
-
-	// Start streaming
-	streamer, err := syncer.StartSync(pos)
+	// Load checkpoint
+	cp, err := r.checkpoint.Load()
 	if err != nil {
-		return fmt.Errorf("failed to start binlog sync: %w", err)
+		r.logger.Warn("Failed to load checkpoint, starting from beginning: %v", err)
+		cp = nil
+	}
+
+	var streamer *replication.BinlogStreamer
+
+	if gtidEnabled {
+		r.logger.Info("MySQL GTID mode detected, using GTID-based replication")
+
+		var gtidSet mysql.GTIDSet
+		if cp != nil && cp.GTIDSet != "" {
+			// Use checkpointed GTID set
+			gtidSet, err = mysql.ParseGTIDSet("mysql", cp.GTIDSet)
+			if err != nil {
+				r.logger.Warn("Failed to parse checkpointed GTID set, getting current GTID set: %v", err)
+				gtidSet, err = r.getCurrentGTIDSet()
+			}
+		} else {
+			// Get current GTID set
+			gtidSet, err = r.getCurrentGTIDSet()
+		}
+
+		if err != nil {
+			r.logger.Warn("Failed to get GTID set, falling back to position-based replication: %v", err)
+			gtidEnabled = false
+		} else {
+			r.logger.Info("Starting CDC from GTID set: %s", gtidSet.String())
+
+			// Start streaming with GTID
+			streamer, err = syncer.StartSyncGTID(gtidSet)
+			if err != nil {
+				return fmt.Errorf("failed to start GTID-based binlog sync: %w", err)
+			}
+		}
+	}
+
+	if !gtidEnabled {
+		r.logger.Info("Using position-based replication")
+
+		var pos mysql.Position
+		if cp != nil && cp.Position != nil {
+			// Use checkpointed position
+			pos = *cp.Position
+		} else {
+			// Start from beginning
+			pos = mysql.Position{
+				Name: "mysql-bin.000001",
+				Pos:  4, // Skip binlog header
+			}
+		}
+
+		r.logger.Info("Starting CDC from position: %s:%d", pos.Name, pos.Pos)
+
+		// Start streaming with position
+		streamer, err = syncer.StartSync(pos)
+		if err != nil {
+			return fmt.Errorf("failed to start position-based binlog sync: %w", err)
+		}
 	}
 
 	defer syncer.Close()
@@ -94,6 +199,12 @@ func (r *CDCReader) Start(ctx context.Context, eventChan chan<- *CDCEvent) error
 				case eventChan <- cdcEvent:
 					r.logger.CDCProgress("Sent CDC event to processor",
 						len(cdcEvent.Rows))
+
+					// Save checkpoint after successful event processing
+					if err := r.saveCheckpoint(gtidEnabled); err != nil {
+						r.logger.Warn("Failed to save checkpoint: %v", err)
+					}
+
 				case <-ctx.Done():
 					return ctx.Err()
 				}
@@ -162,4 +273,53 @@ func (r *CDCReader) rowToMap(row []interface{}) map[string]interface{} {
 		result[fmt.Sprintf("col_%d", i)] = value
 	}
 	return result
+}
+
+// saveCheckpoint saves the current replication position/GTID set
+func (r *CDCReader) saveCheckpoint(gtidEnabled bool) error {
+	cp := &checkpoint.Checkpoint{
+		Timestamp: time.Now().Unix(),
+	}
+
+	if gtidEnabled {
+		// For GTID mode, we need to get the current GTID set from MySQL
+		gtidSet, err := r.getCurrentGTIDSet()
+		if err != nil {
+			return fmt.Errorf("failed to get current GTID set: %w", err)
+		}
+		cp.GTIDSet = gtidSet.String()
+	} else {
+		// For position mode, query MySQL for current binlog file and position
+		pos, err := r.getCurrentBinlogPosition()
+		if err != nil {
+			return fmt.Errorf("failed to get current binlog position: %w", err)
+		}
+		cp.Position = pos
+	}
+
+	return r.checkpoint.Save(cp)
+}
+
+// getCurrentBinlogPosition queries MySQL for the current binlog file and position
+func (r *CDCReader) getCurrentBinlogPosition() (*mysql.Position, error) {
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/mysql",
+		r.cfg.MySQL.User, r.cfg.MySQL.Password, r.cfg.MySQL.Host, r.cfg.MySQL.Port)
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to MySQL: %w", err)
+	}
+	defer db.Close()
+
+	var file string
+	var position uint32
+	err = db.QueryRow("SHOW MASTER STATUS").Scan(&file, &position, nil, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query master status: %w", err)
+	}
+
+	return &mysql.Position{
+		Name: file,
+		Pos:  position,
+	}, nil
 }
