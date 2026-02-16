@@ -2,16 +2,18 @@ package pipeline
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
-	"strings"
 
 	"github.com/ChaosHour/mysql2bq/internal/config"
 	"github.com/ChaosHour/mysql2bq/internal/logging"
+	_ "github.com/go-sql-driver/mysql"
 )
 
 type Pipeline struct {
-	cfg    *config.Config
-	logger *logging.Logger
+	cfg     *config.Config
+	logger  *logging.Logger
+	metrics *CDCMetrics
 }
 
 func New(cfg *config.Config) (*Pipeline, error) {
@@ -23,8 +25,9 @@ func New(cfg *config.Config) (*Pipeline, error) {
 	}
 
 	return &Pipeline{
-		cfg:    cfg,
-		logger: logger,
+		cfg:     cfg,
+		logger:  logger,
+		metrics: NewCDCMetrics(),
 	}, nil
 }
 
@@ -35,6 +38,11 @@ func (p *Pipeline) Run(ctx context.Context) error {
 
 	// Log configuration for debugging
 	p.logConfiguration()
+
+	// Detect GTID mode for metrics
+	if err := p.detectGTIDMode(); err != nil {
+		p.logger.Warn("Failed to detect GTID mode for metrics: %v", err)
+	}
 
 	// Create CDC event channel
 	eventChan := make(chan *CDCEvent, 100) // Buffered channel for events
@@ -70,7 +78,19 @@ func (p *Pipeline) Run(ctx context.Context) error {
 			// Write event to BigQuery
 			if err := bqWriter.WriteEvent(ctx, event); err != nil {
 				p.logger.CDCError("Failed to write event to BigQuery", err)
+				p.metrics.RecordError(err)
 				// In production, you might want to implement retry logic or dead letter queue
+			} else {
+				// Record successful event processing
+				position := event.Position.Name
+				if position == "" {
+					position = fmt.Sprintf("%d", event.Position.Pos)
+				}
+				p.metrics.RecordEvent(
+					fmt.Sprintf("%s.%s", event.Database, event.Table),
+					len(event.Rows),
+					position,
+				)
 			}
 		}
 	}
@@ -84,9 +104,40 @@ func (p *Pipeline) logConfiguration() {
 	p.logger.Debug("Batching config: max_rows=%d max_delay=%s", p.cfg.Batching.MaxRows, p.cfg.Batching.MaxDelay)
 }
 
+// GetMetrics returns a snapshot of current CDC metrics
+func (p *Pipeline) GetMetrics() CDCMetricsSnapshot {
+	return p.metrics.GetSnapshot()
+}
+
+// SetGTIDMode sets whether GTID mode is enabled for metrics tracking
+func (p *Pipeline) SetGTIDMode(enabled bool) {
+	p.metrics.GTIDEnabled = enabled
+}
+
+// detectGTIDMode detects if MySQL is using GTID mode and sets it on metrics
+func (p *Pipeline) detectGTIDMode() error {
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/mysql",
+		p.cfg.MySQL.User, p.cfg.MySQL.Password, p.cfg.MySQL.Host, p.cfg.MySQL.Port)
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return fmt.Errorf("failed to connect to MySQL: %w", err)
+	}
+	defer db.Close()
+
+	var gtidMode string
+	err = db.QueryRow("SELECT @@global.gtid_mode").Scan(&gtidMode)
+	if err != nil {
+		return fmt.Errorf("failed to query GTID mode: %w", err)
+	}
+
+	p.metrics.GTIDEnabled = (gtidMode == "ON")
+	return nil
+}
+
 // parseLogLevel converts string log level to Level enum
 func parseLogLevel(level string) logging.Level {
-	switch strings.ToLower(level) {
+	switch level {
 	case "debug":
 		return logging.DEBUG
 	case "info":

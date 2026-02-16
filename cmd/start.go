@@ -3,6 +3,9 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/ChaosHour/mysql2bq/internal/config"
 	"github.com/ChaosHour/mysql2bq/internal/pipeline"
@@ -15,6 +18,9 @@ var startCmd = &cobra.Command{
 	Use:   "start",
 	Short: "Start CDC replication",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+
 		cfg, err := config.Load(configPath)
 		if err != nil {
 			return fmt.Errorf("failed to load config: %w", err)
@@ -26,7 +32,7 @@ var startCmd = &cobra.Command{
 		}
 
 		fmt.Println("Starting pipeline...")
-		return p.Run(context.Background())
+		return p.Run(ctx)
 	},
 }
 

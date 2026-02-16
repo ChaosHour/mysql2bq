@@ -11,9 +11,11 @@ mysql2bq replicates data changes from MySQL databases to Google BigQuery in real
 ## Features
 
 - Real-time data replication from MySQL to BigQuery
+- **Automatic GTID or position-based replication detection**
+- **Comprehensive metrics tracking for monitoring CDC progress**
 - Configurable table selection
 - Batching for efficient data transfer
-- Checkpointing for resumable operations
+- Checkpointing for resumable operations (supports both GTID and position checkpoints)
 
 ## Installation
 
@@ -124,6 +126,54 @@ Key settings include:
 - Batching parameters
 - Checkpoint configuration
 
+## GTID and Position-Based Replication
+
+mysql2bq automatically detects whether your MySQL server is using GTID (Global Transaction Identifier) mode or position-based replication:
+
+- **GTID Mode**: If `@@global.gtid_mode = 'ON'`, the tool will use GTID-based synchronization for more reliable replication across server restarts and topology changes.
+- **Position-Based Mode**: If GTID is not enabled, it falls back to traditional binlog file position-based replication.
+
+The tool will log which mode it's using at startup:
+
+```text
+MySQL GTID mode detected, using GTID-based replication
+```
+
+or
+
+```text
+Using position-based replication
+```
+
+Checkpoints are stored appropriately for each mode:
+
+- GTID mode: Stores the executed GTID set
+- Position mode: Stores binlog file name and position
+
+## Metrics and Monitoring
+
+mysql2bq tracks comprehensive metrics for monitoring CDC progress:
+
+### Global Metrics
+
+- **Total Events Processed**: Number of CDC events (INSERT/UPDATE/DELETE) processed
+- **Total Rows Processed**: Total number of data rows replicated
+- **Events/Rows Per Second**: Current processing rates
+- **Current Position**: Latest GTID set or binlog position
+- **Uptime**: How long the pipeline has been running
+- **Error Count**: Number of processing errors encountered
+
+### Table-Specific Metrics
+
+- **Events Processed**: Per-table event counts
+- **Rows Processed**: Per-table row counts
+- **Last Processed Time**: When each table was last updated
+- **Current Position**: Latest position for each table
+
+### Accessing Metrics
+
+Metrics are tracked internally and can be accessed programmatically for monitoring dashboards or alerting systems.
+
 ## Usage
 
 Start the replication:
@@ -141,3 +191,20 @@ Start the replication:
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+---
+
+## Recent Improvements
+
+✔ Graceful shutdown with SIGINT/SIGTERM  
+✔ Config validation at startup  
+✔ **Automatic GTID/position-based replication detection**  
+✔ Checkpoint store interface with GTID and position support  
+✔ Improved CDC reliability foundations  
+
+### Recommended Next Steps
+
+- Implement binlog resume using checkpoint
+- Add BigQuery insertId for idempotency
+- Implement batch flush retry logic
+- Add metrics endpoint
