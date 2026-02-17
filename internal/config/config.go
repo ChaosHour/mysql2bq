@@ -39,6 +39,12 @@ type Config struct {
 		Timeout  string `yaml:"timeout,omitempty"`
 	} `yaml:"batching"`
 
+	Retry struct {
+		MaxAttempts  int    `yaml:"max_attempts"`
+		InitialDelay string `yaml:"initial_delay"`
+		MaxDelay     string `yaml:"max_delay"`
+	} `yaml:"retry,omitempty"`
+
 	Checkpoint struct {
 		Type string `yaml:"type"`
 		Path string `yaml:"path"`
@@ -48,6 +54,13 @@ type Config struct {
 		Level string `yaml:"level,omitempty"`
 		File  string `yaml:"file,omitempty"`
 	} `yaml:"logging,omitempty"`
+
+	HTTP struct {
+		Enabled bool   `yaml:"enabled,omitempty"`
+		Host    string `yaml:"host,omitempty"`
+		Port    int    `yaml:"port,omitempty"`
+		Path    string `yaml:"path,omitempty"`
+	} `yaml:"http,omitempty"`
 
 	TimePartitioning           string `yaml:"time_partitioning,omitempty"`
 	TimePartitioningExpiration string `yaml:"time_partitioning_expiration,omitempty"`

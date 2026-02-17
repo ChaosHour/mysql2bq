@@ -18,6 +18,23 @@ type CDCReader struct {
 	cfg        *config.Config
 	logger     *logging.Logger
 	checkpoint checkpoint.Store
+
+	// Asynchronous checkpointing
+	checkpointChan        chan *checkpoint.Checkpoint
+	checkpointDone        chan struct{}
+	lastCheckpoint        time.Time
+	eventsSinceCheckpoint int64
+}
+
+func NewCDCReader(cfg *config.Config, logger *logging.Logger) *CDCReader {
+	return &CDCReader{
+		cfg:            cfg,
+		logger:         logger,
+		checkpoint:     checkpoint.NewFileStore(cfg.Checkpoint.Path),
+		checkpointChan: make(chan *checkpoint.Checkpoint, 10), // Buffered channel
+		checkpointDone: make(chan struct{}),
+		lastCheckpoint: time.Now(),
+	}
 }
 
 type CDCEvent struct {
@@ -28,14 +45,6 @@ type CDCEvent struct {
 	Timestamp   time.Time
 	Position    mysql.Position
 	Transaction string
-}
-
-func NewCDCReader(cfg *config.Config, logger *logging.Logger) *CDCReader {
-	return &CDCReader{
-		cfg:        cfg,
-		logger:     logger,
-		checkpoint: checkpoint.NewFileStore(cfg.Checkpoint.Path),
-	}
 }
 
 // detectGTIDMode checks if MySQL is using GTID mode
@@ -173,10 +182,15 @@ func (r *CDCReader) Start(ctx context.Context, eventChan chan<- *CDCEvent) error
 
 	r.logger.CDCStart("CDC reader started successfully")
 
+	// Start asynchronous checkpoint saver
+	go r.checkpointSaver(ctx)
+
 	for {
 		select {
 		case <-ctx.Done():
 			r.logger.CDCComplete("CDC reader stopped by context cancellation")
+			close(r.checkpointChan) // Signal checkpoint saver to stop
+			<-r.checkpointDone      // Wait for checkpoint saver to finish
 			return ctx.Err()
 
 		default:
@@ -200,9 +214,18 @@ func (r *CDCReader) Start(ctx context.Context, eventChan chan<- *CDCEvent) error
 					r.logger.CDCProgress("Sent CDC event to processor",
 						len(cdcEvent.Rows))
 
-					// Save checkpoint after successful event processing
-					if err := r.saveCheckpoint(gtidEnabled); err != nil {
-						r.logger.Warn("Failed to save checkpoint: %v", err)
+					// Queue checkpoint for asynchronous saving
+					r.eventsSinceCheckpoint++
+					if r.shouldCheckpoint() {
+						if cp := r.createCheckpoint(gtidEnabled); cp != nil {
+							select {
+							case r.checkpointChan <- cp:
+								r.eventsSinceCheckpoint = 0
+								r.lastCheckpoint = time.Now()
+							default:
+								r.logger.Warn("Checkpoint channel full, skipping checkpoint")
+							}
+						}
 					}
 
 				case <-ctx.Done():
@@ -275,31 +298,6 @@ func (r *CDCReader) rowToMap(row []interface{}) map[string]interface{} {
 	return result
 }
 
-// saveCheckpoint saves the current replication position/GTID set
-func (r *CDCReader) saveCheckpoint(gtidEnabled bool) error {
-	cp := &checkpoint.Checkpoint{
-		Timestamp: time.Now().Unix(),
-	}
-
-	if gtidEnabled {
-		// For GTID mode, we need to get the current GTID set from MySQL
-		gtidSet, err := r.getCurrentGTIDSet()
-		if err != nil {
-			return fmt.Errorf("failed to get current GTID set: %w", err)
-		}
-		cp.GTIDSet = gtidSet.String()
-	} else {
-		// For position mode, query MySQL for current binlog file and position
-		pos, err := r.getCurrentBinlogPosition()
-		if err != nil {
-			return fmt.Errorf("failed to get current binlog position: %w", err)
-		}
-		cp.Position = pos
-	}
-
-	return r.checkpoint.Save(cp)
-}
-
 // getCurrentBinlogPosition queries MySQL for the current binlog file and position
 func (r *CDCReader) getCurrentBinlogPosition() (*mysql.Position, error) {
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/mysql",
@@ -322,4 +320,63 @@ func (r *CDCReader) getCurrentBinlogPosition() (*mysql.Position, error) {
 		Name: file,
 		Pos:  position,
 	}, nil
+}
+
+// checkpointSaver runs in a goroutine to save checkpoints asynchronously
+func (r *CDCReader) checkpointSaver(ctx context.Context) {
+	defer close(r.checkpointDone)
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Save final checkpoint before shutting down
+			r.logger.Info("Saving final checkpoint before shutdown")
+			return
+
+		case cp, ok := <-r.checkpointChan:
+			if !ok {
+				// Channel closed, exit
+				return
+			}
+
+			if err := r.checkpoint.Save(cp); err != nil {
+				r.logger.Warn("Failed to save checkpoint asynchronously: %v", err)
+			} else {
+				r.logger.Debug("Checkpoint saved successfully")
+			}
+		}
+	}
+}
+
+// shouldCheckpoint determines if a checkpoint should be saved
+func (r *CDCReader) shouldCheckpoint() bool {
+	// Checkpoint every 100 events or every 30 seconds
+	return r.eventsSinceCheckpoint >= 100 || time.Since(r.lastCheckpoint) >= 30*time.Second
+}
+
+// createCheckpoint creates a checkpoint object with current position/GTID
+func (r *CDCReader) createCheckpoint(gtidEnabled bool) *checkpoint.Checkpoint {
+	cp := &checkpoint.Checkpoint{
+		Timestamp: time.Now().Unix(),
+	}
+
+	if gtidEnabled {
+		// For GTID mode, we need to get the current GTID set from MySQL
+		gtidSet, err := r.getCurrentGTIDSet()
+		if err != nil {
+			r.logger.Warn("Failed to get current GTID set for checkpoint: %v", err)
+			return nil
+		}
+		cp.GTIDSet = gtidSet.String()
+	} else {
+		// For position mode, query MySQL for current binlog file and position
+		pos, err := r.getCurrentBinlogPosition()
+		if err != nil {
+			r.logger.Warn("Failed to get current binlog position for checkpoint: %v", err)
+			return nil
+		}
+		cp.Position = pos
+	}
+
+	return cp
 }

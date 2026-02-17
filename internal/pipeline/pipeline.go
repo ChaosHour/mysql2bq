@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/ChaosHour/mysql2bq/internal/config"
 	"github.com/ChaosHour/mysql2bq/internal/logging"
@@ -11,9 +12,10 @@ import (
 )
 
 type Pipeline struct {
-	cfg     *config.Config
-	logger  *logging.Logger
-	metrics *CDCMetrics
+	cfg           *config.Config
+	logger        *logging.Logger
+	metrics       *CDCMetrics
+	metricsServer *MetricsServer
 }
 
 func New(cfg *config.Config) (*Pipeline, error) {
@@ -24,10 +26,13 @@ func New(cfg *config.Config) (*Pipeline, error) {
 		return nil, fmt.Errorf("failed to initialize logger: %w", err)
 	}
 
+	metrics := NewCDCMetrics()
+
 	return &Pipeline{
-		cfg:     cfg,
-		logger:  logger,
-		metrics: NewCDCMetrics(),
+		cfg:           cfg,
+		logger:        logger,
+		metrics:       metrics,
+		metricsServer: NewMetricsServer(cfg, logger, metrics),
 	}, nil
 }
 
@@ -38,6 +43,18 @@ func (p *Pipeline) Run(ctx context.Context) error {
 
 	// Log configuration for debugging
 	p.logConfiguration()
+
+	// Start metrics server
+	if err := p.metricsServer.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start metrics server: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := p.metricsServer.Stop(shutdownCtx); err != nil {
+			p.logger.Warn("Failed to stop metrics server gracefully: %v", err)
+		}
+	}()
 
 	// Detect GTID mode for metrics
 	if err := p.detectGTIDMode(); err != nil {

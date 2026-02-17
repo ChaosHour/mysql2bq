@@ -15,5 +15,28 @@ func (c *Config) Validate() error {
 	if c.Batching.MaxRows <= 0 {
 		return fmt.Errorf("batching.max_rows must be > 0")
 	}
+
+	// Set retry defaults if not configured
+	if c.Retry.MaxAttempts <= 0 {
+		c.Retry.MaxAttempts = 3
+	}
+	if c.Retry.InitialDelay == "" {
+		c.Retry.InitialDelay = "1s"
+	}
+	if c.Retry.MaxDelay == "" {
+		c.Retry.MaxDelay = "30s"
+	}
+
+	// Set HTTP defaults if not configured
+	if c.HTTP.Host == "" {
+		c.HTTP.Host = "localhost"
+	}
+	if c.HTTP.Port <= 0 {
+		c.HTTP.Port = 8080
+	}
+	if c.HTTP.Path == "" {
+		c.HTTP.Path = "/metrics"
+	}
+
 	return nil
 }
