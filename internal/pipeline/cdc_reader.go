@@ -149,7 +149,22 @@ func (r *CDCReader) Start(ctx context.Context, eventChan chan<- *CDCEvent) error
 			// Start streaming with GTID
 			streamer, err = syncer.StartSyncGTID(gtidSet)
 			if err != nil {
-				return fmt.Errorf("failed to start GTID-based binlog sync: %w", err)
+				// Attempt to fallback to position-based replication if GTID streaming fails
+				r.logger.Warn("GTID-based sync failed: %v — attempting position-based fallback", err)
+
+				pos, posErr := r.getCurrentBinlogPosition()
+				if posErr != nil {
+					return fmt.Errorf("failed to start GTID-based binlog sync: %w; fallback to position failed: %v", err, posErr)
+				}
+
+				r.logger.Info("Falling back to position-based replication starting at %s:%d", pos.Name, pos.Pos)
+				streamer, err = syncer.StartSync(*pos)
+				if err != nil {
+					return fmt.Errorf("failed to start fallback position-based binlog sync: %w", err)
+				}
+
+				// Mark GTID as disabled for downstream checkpoint logic
+				gtidEnabled = false
 			}
 		}
 	}
@@ -244,8 +259,10 @@ func (r *CDCReader) processEvent(ev *replication.BinlogEvent) (*CDCEvent, error)
 		return r.processRowsEvent(ev, "UPDATE")
 	case replication.DELETE_ROWS_EVENTv1, replication.DELETE_ROWS_EVENTv2:
 		return r.processRowsEvent(ev, "DELETE")
+	case replication.QUERY_EVENT:
+		return r.processQueryEvent(ev)
 	default:
-		// Skip other event types (queries, etc.)
+		// Skip other event types
 		return nil, nil
 	}
 }
@@ -286,6 +303,38 @@ func (r *CDCReader) processRowsEvent(ev *replication.BinlogEvent, eventType stri
 	}
 
 	return cdcEvent, nil
+}
+
+func (r *CDCReader) processQueryEvent(ev *replication.BinlogEvent) (*CDCEvent, error) {
+	queryEvent := ev.Event.(*replication.QueryEvent)
+	query := string(queryEvent.Query)
+
+	// Check for transaction boundary queries
+	switch query {
+	case "BEGIN", "START TRANSACTION":
+		return &CDCEvent{
+			EventType: "BEGIN",
+			Timestamp: time.Unix(int64(ev.Header.Timestamp), 0),
+			Position: mysql.Position{
+				Name: "", // Would need to track current binlog file
+				Pos:  ev.Header.LogPos,
+			},
+			Transaction: fmt.Sprintf("tx_%d", ev.Header.LogPos), // Use log position as transaction ID
+		}, nil
+	case "COMMIT":
+		return &CDCEvent{
+			EventType: "COMMIT",
+			Timestamp: time.Unix(int64(ev.Header.Timestamp), 0),
+			Position: mysql.Position{
+				Name: "", // Would need to track current binlog file
+				Pos:  ev.Header.LogPos,
+			},
+			Transaction: fmt.Sprintf("tx_%d", ev.Header.LogPos), // Use log position as transaction ID
+		}, nil
+	default:
+		// Skip other queries
+		return nil, nil
+	}
 }
 
 func (r *CDCReader) rowToMap(row []interface{}) map[string]interface{} {

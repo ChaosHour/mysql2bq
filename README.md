@@ -18,6 +18,10 @@ mysql2bq replicates data changes from MySQL databases to Google BigQuery in real
 - **Automatic retry logic with exponential backoff for resilient writes**
 - **HTTP metrics endpoint for real-time monitoring**
 - **Asynchronous checkpointing for reliable binlog resume**
+- **Transaction-aware event buffering for data consistency**
+- **Schema auto-creation from MySQL table inspection**
+- **Worker pool with backpressure control for high-throughput processing**
+- **Advanced monitoring with BigQuery write metrics and transaction tracking**
 - Configurable table selection
 - Batching for efficient data transfer
 - Checkpointing for resumable operations (supports both GTID and position checkpoints)
@@ -344,43 +348,44 @@ Caveats & recommendations:
 
 - `insertId` is used to reduce duplicates, but consider application-level uniqueness or verification checksums for stricter guarantees.
 
-## Testing the one-time sync (QA / Production)
+## Testing the one-time sync (validation)
 
-Follow these steps when validating a `mode: "once"` (snapshot + binlog-catchup) run in QA or Production.
+Follow these steps when validating a `mode: "once"` (snapshot + binlog-catchup) run.
 
-### Quick safety checklist ✅
+### Quick safety checklist
+
 - Backup or snapshot the target BigQuery table (or write to a test dataset).
-- Use a dedicated `checkpoint.path` for test runs to avoid interfering with production checkpoint state.
+- Use a dedicated `checkpoint.path` for validation runs to avoid interfering with other checkpoint state.
 - Ensure the BigQuery service account / credentials are configured and have write access.
-- If possible, run first against a staging dataset/table and validate rows/row counts before pointing at production.
+- If possible, run first against a cloned dataset/table and validate rows/row counts before switching the target.
 
-### Example QA config (fast, verbose, isolated)
+### Example config — isolated / verification (smaller batches)
 
 ```yaml
 mode: "once"
 mysql:
-  host: "qa-mysql.local"
+  host: "example-mysql.local"
   port: 3306
   user: "replicator"
   password: "secret"
   server_id: 101
 bigquery:
   project: "your-gcp-project"
-  dataset: "qa_dataset"
-  service_account_key_json: "/secrets/qa-gcp-key.json"
+  dataset: "example_dataset"
+  service_account_key_json: "/secrets/gcp-key.json"
 cdc:
   tables:
     - db: "app_db"
       table: "users"
 batching:
-  max_rows: 100
+  max_rows: 100                # smaller batches for visibility during validation
 retry:
   max_attempts: 3
   initial_delay: "1s"
   max_delay: "10s"
 checkpoint:
   type: "file"
-  path: "/var/lib/mysql2bq/checkpoint-qa.json"
+  path: "/var/lib/mysql2bq/checkpoint-once-example.json"   # isolated checkpoint
 http:
   enabled: true
   host: "0.0.0.0"
@@ -390,29 +395,29 @@ logging:
   level: "debug"
 ```
 
-### Example Production config (safe, higher-throughput)
+### Example config — higher-throughput
 
 ```yaml
 mode: "once"
 mysql:
-  host: "prod-mysql-1.internal"
+  host: "db.example.internal"
   port: 3306
   user: "replicator"
   password: "REDACTED"
   server_id: 201
 bigquery:
   project: "your-gcp-project"
-  dataset: "prod_dataset"
-  service_account_key_json: "/secrets/prod-gcp-key.json"
+  dataset: "target_dataset"
+  service_account_key_json: "/secrets/gcp-key.json"
 batching:
-  max_rows: 2000
+  max_rows: 2000               # larger batches for throughput
 retry:
   max_attempts: 5
   initial_delay: "1s"
   max_delay: "30s"
 checkpoint:
   type: "file"
-  path: "/var/lib/mysql2bq/checkpoint-once-prod.json"
+  path: "/var/lib/mysql2bq/checkpoint-once-highthroughput.json"
 http:
   enabled: true
   host: "0.0.0.0"
@@ -426,16 +431,17 @@ logging:
 - Run binary (uses config file; `--mode` overrides `config.Mode`):
 
 ```bash
-./bin/mysql2bq start --config /etc/mysql2bq/config.prod.yaml --mode once
+./bin/mysql2bq start --config /etc/mysql2bq/config.once.yaml --mode once
 ```
 
 - Run with Docker Compose (mount config + credentials into the container):
 
 ```bash
-docker-compose run --rm -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/prod-gcp-key.json mysql2bq start --config /etc/mysql2bq/config.docker.yaml --mode once
+docker-compose run --rm -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcp-key.json mysql2bq start --config /etc/mysql2bq/config.docker.yaml --mode once
 ```
 
-### What to watch while the job runs 🔎
+### What to watch while the job runs
+
 - Logs: look for these informational messages in order:
   - `Snapshot start point captured` — snapshot start position recorded
   - `Snapshot complete; will stream binlog events until ...` — stop point captured
@@ -444,7 +450,8 @@ docker-compose run --rm -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/prod-gcp-key.
 - Metrics: poll the `GET /metrics` endpoint (if enabled) to monitor progress and error counters.
 - Checkpoint file: verify `checkpoint.path` shows the stop position/GTID after completion.
 
-### Post-run verification ✅
+### Post-run verification
+
 1. Compare row counts (and a few sample rows or checksums) between source DB and BigQuery target.
 2. Inspect BigQuery for duplicate rows (use a unique key in SQL or sample dedupe queries).
 3. Confirm checkpoint file has been updated to the stop position/GTID.
@@ -452,12 +459,38 @@ docker-compose run --rm -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/prod-gcp-key.
 
 > Tip: run the `once` sync into a separate BigQuery dataset/table when validating changes — only switch production writes after verification.
 
-### Troubleshooting tips ⚠️
+### Troubleshooting tips
+
 - GTID resume failed / GTIDs purged: the pipeline falls back to position-based start and logs a warning. Verify the checkpoint and re-run if needed.
 - Long-running snapshot: prefer using a consistent snapshot/backup method for very large tables to avoid long locks or heavy load.
 - Permanent row failures: check BigQuery insert error details (non-retryable rows will be reported) and fix schema/data issues before retrying.
 
 ## Usage
+
+### Seeder PoC (snapshot → stream)
+
+A proof-of-concept seeder command that demonstrates callback-based emission pattern inspired by Gravity's architecture.
+
+Run the seeder PoC:
+
+```bash
+# Run the seeder PoC using the main CLI
+./bin/mysql2bq seeder --config config.yaml
+```
+
+This demonstrates:
+
+- Callback-based row emission (Gravity-inspired pattern)
+- Mock table scanning with configurable tables
+- BigQuery integration ready for real data
+
+Notes:
+
+- Currently uses mock data for demonstration
+- Ready for integration with actual Gravity scanner
+- Will be evolved into full backfill command in Phase 2
+
+## Usage2
 
 Start the replication:
 
@@ -488,3 +521,23 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ✔ **Batch flush with retry logic for robust data transfer**
 ✔ **HTTP metrics endpoint for monitoring**
 ✔ **Asynchronous checkpointing for reliable binlog resume**
+✔ **Transaction-aware event buffering for data consistency**
+✔ **Schema auto-creation from MySQL table inspection**
+✔ **Worker pool with backpressure control for high-throughput processing**
+✔ **Advanced monitoring with BigQuery write metrics and transaction tracking**
+
+## Roadmap
+
+### Phase 1: Core Functionality ✅
+
+- ✅ MySQL snapshot scanning
+- ✅ Binlog streaming with GTID/position support
+- ✅ BigQuery writing with insertId for idempotency
+- ✅ Checkpointing for resumable operations
+- ✅ Basic metrics tracking
+
+### Phase 2: Reliability and Completeness ✅
+
+- ✅ Automatic GTID/position-based replication detection
+- ✅ Checkpoint store interface with GTID and position support
+- ✅ Improved CDC reliability foundations (retry logic, error handling)

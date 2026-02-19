@@ -13,6 +13,7 @@ import (
 )
 
 var configPath string
+var runMode string
 
 var startCmd = &cobra.Command{
 	Use:   "start",
@@ -24,6 +25,11 @@ var startCmd = &cobra.Command{
 		cfg, err := config.Load(configPath)
 		if err != nil {
 			return fmt.Errorf("failed to load config: %w", err)
+		}
+
+		// Override mode from CLI if provided
+		if runMode != "" {
+			cfg.Mode = runMode
 		}
 
 		p, err := pipeline.New(cfg)
@@ -38,5 +44,6 @@ var startCmd = &cobra.Command{
 
 func init() {
 	startCmd.Flags().StringVar(&configPath, "config", "config.yaml", "Path to config file")
+	startCmd.Flags().StringVar(&runMode, "mode", "", "Run mode: continuous (default) or once")
 	rootCmd.AddCommand(startCmd)
 }

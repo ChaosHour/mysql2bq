@@ -39,6 +39,12 @@ type Config struct {
 		Timeout  string `yaml:"timeout,omitempty"`
 	} `yaml:"batching"`
 
+	BigQueryWriter struct {
+		NumWorkers    int `yaml:"num_workers,omitempty"`
+		RateLimit     int `yaml:"rate_limit,omitempty"` // requests per second
+		ChannelBuffer int `yaml:"channel_buffer,omitempty"`
+	} `yaml:"bigquery_writer,omitempty"`
+
 	Retry struct {
 		MaxAttempts  int    `yaml:"max_attempts"`
 		InitialDelay string `yaml:"initial_delay"`
@@ -61,6 +67,8 @@ type Config struct {
 		Port    int    `yaml:"port,omitempty"`
 		Path    string `yaml:"path,omitempty"`
 	} `yaml:"http,omitempty"`
+
+	Mode string `yaml:"mode,omitempty"` // "continuous" (default) or "once"
 
 	TimePartitioning           string `yaml:"time_partitioning,omitempty"`
 	TimePartitioningExpiration string `yaml:"time_partitioning_expiration,omitempty"`
