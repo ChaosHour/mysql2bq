@@ -126,7 +126,8 @@ func TestBigQueryWriter_Batching(t *testing.T) {
 	cfg.Batching.MaxRows = 2            // Small batch size for testing
 
 	logger := &logging.Logger{} // Mock logger
-	writer, err := NewBigQueryWriter(cfg, logger)
+	metrics := NewCDCMetrics()
+	writer, err := NewBigQueryWriter(cfg, logger, metrics)
 	if err != nil {
 		t.Fatalf("Failed to create BigQuery writer: %v", err)
 	}
@@ -199,7 +200,8 @@ func TestBigQueryWriter_RetryDelay(t *testing.T) {
 	cfg.Retry.MaxDelay = "10s"
 
 	logger := &logging.Logger{}
-	writer, err := NewBigQueryWriter(cfg, logger)
+	metrics := NewCDCMetrics()
+	writer, err := NewBigQueryWriter(cfg, logger, metrics)
 	if err != nil {
 		t.Fatalf("Failed to create BigQuery writer: %v", err)
 	}
@@ -226,7 +228,8 @@ func TestBigQueryWriter_IsRetryableError(t *testing.T) {
 	cfg.BigQuery.Project = "my-project"
 
 	logger := &logging.Logger{}
-	writer, err := NewBigQueryWriter(cfg, logger)
+	metrics := NewCDCMetrics()
+	writer, err := NewBigQueryWriter(cfg, logger, metrics)
 	if err != nil {
 		t.Fatalf("Failed to create BigQuery writer: %v", err)
 	}
@@ -248,5 +251,62 @@ func TestBigQueryWriter_IsRetryableError(t *testing.T) {
 		if result != tc.expected {
 			t.Errorf("isRetryableError(%v) = %v, expected %v", tc.err, result, tc.expected)
 		}
+	}
+}
+
+func TestSplitPutMultiError_Partitioning(t *testing.T) {
+	// Create two sample rows
+	row1 := &bigquery.StructSaver{Struct: map[string]bigquery.Value{"id": 1}, InsertID: "i1"}
+	row2 := &bigquery.StructSaver{Struct: map[string]bigquery.Value{"id": 2}, InsertID: "i2"}
+	rows := []bigquery.ValueSaver{row1, row2}
+
+	// Case A: first row transient, second row duplicate -> expect 1 retry, 1 ignored, no permErr
+	pmeA := bigquery.PutMultiError{
+		bigquery.RowInsertionError{RowIndex: 0, Errors: bigquery.MultiError{bigquery.Error{Reason: "backendError", Message: "internal"}}},
+		bigquery.RowInsertionError{RowIndex: 1, Errors: bigquery.MultiError{bigquery.Error{Reason: "duplicate", Message: "duplicate row"}}},
+	}
+
+	retryRows, ignored, permErr := splitPutMultiError(pmeA, rows)
+	if permErr != nil {
+		t.Fatalf("expected no permanent error, got %v", permErr)
+	}
+	if ignored != 1 {
+		t.Fatalf("expected 1 ignored duplicate, got %d", ignored)
+	}
+	if len(retryRows) != 1 {
+		t.Fatalf("expected 1 retry row, got %d", len(retryRows))
+	}
+
+	// Case B: permanent validation error on row 0
+	pmeB := bigquery.PutMultiError{
+		bigquery.RowInsertionError{RowIndex: 0, Errors: bigquery.MultiError{bigquery.Error{Reason: "invalid", Message: "schema mismatch"}}},
+	}
+
+	retryRows, ignored, permErr = splitPutMultiError(pmeB, rows)
+	if permErr == nil {
+		t.Fatalf("expected permanent error, got nil")
+	}
+	if len(retryRows) != 0 {
+		t.Fatalf("expected 0 retry rows, got %d", len(retryRows))
+	}
+	if ignored != 0 {
+		t.Fatalf("expected 0 ignored rows, got %d", ignored)
+	}
+
+	// Case C: both rows transient -> expect 2 retry rows
+	pmeC := bigquery.PutMultiError{
+		bigquery.RowInsertionError{RowIndex: 0, Errors: bigquery.MultiError{bigquery.Error{Reason: "backendError"}}},
+		bigquery.RowInsertionError{RowIndex: 1, Errors: bigquery.MultiError{bigquery.Error{Reason: "serviceUnavailable"}}},
+	}
+
+	retryRows, ignored, permErr = splitPutMultiError(pmeC, rows)
+	if permErr != nil {
+		t.Fatalf("expected no permanent error, got %v", permErr)
+	}
+	if ignored != 0 {
+		t.Fatalf("expected 0 ignored rows, got %d", ignored)
+	}
+	if len(retryRows) != 2 {
+		t.Fatalf("expected 2 retry rows, got %d", len(retryRows))
 	}
 }

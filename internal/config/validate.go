@@ -16,6 +16,13 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("batching.max_rows must be > 0")
 	}
 
+	// Normalize/validate run mode
+	if c.Mode == "" {
+		c.Mode = "continuous"
+	} else if c.Mode != "continuous" && c.Mode != "once" {
+		return fmt.Errorf("invalid mode: %s (must be 'continuous' or 'once')", c.Mode)
+	}
+
 	// Set retry defaults if not configured
 	if c.Retry.MaxAttempts <= 0 {
 		c.Retry.MaxAttempts = 3

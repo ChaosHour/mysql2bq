@@ -18,6 +18,10 @@ mysql2bq replicates data changes from MySQL databases to Google BigQuery in real
 - **Automatic retry logic with exponential backoff for resilient writes**
 - **HTTP metrics endpoint for real-time monitoring**
 - **Asynchronous checkpointing for reliable binlog resume**
+- **Transaction-aware event buffering for data consistency**
+- **Schema auto-creation from MySQL table inspection**
+- **Worker pool with backpressure control for high-throughput processing**
+- **Advanced monitoring with BigQuery write metrics and transaction tracking**
 - Configurable table selection
 - Batching for efficient data transfer
 - Checkpointing for resumable operations (supports both GTID and position checkpoints)
@@ -195,6 +199,18 @@ This prevents duplicate rows from being inserted if the same CDC event is proces
 
 The insertId format is: `(binlog-file, position):transaction:row-index`
 
+Important caveat — BigQuery deduplication window
+
+- BigQuery performs best-effort de-duplication for `insertId` values and the deduplication window is short (approximately 1 minute).
+- If the same row is retried after the deduplication window has passed (for example, long outages or delayed retries), duplicates may still appear in the target table.
+- To guard against this, combine `insertId` with an idempotent downstream schema (unique key), shorter checkpoint intervals, or application-level deduplication as needed.
+
+GTID caveats and resume behavior
+
+- GTID-based resume is preferred, but GTIDs can be purged on source servers (e.g. `@@global.gtid_purged`), which may make an older checkpoint impossible to resume by GTID alone.
+- mysql2bq attempts a GTID resume when possible — if GTID resume fails (for example due to purged GTIDs), it will automatically fall back to position-based start and log a warning.
+- Always verify GTID/backup procedures when relying on GTID resumes in production.
+
 ## Batch Processing and Retry Logic
 
 mysql2bq optimizes data transfer efficiency and reliability through configurable batching and automatic retry mechanisms:
@@ -210,6 +226,7 @@ mysql2bq optimizes data transfer efficiency and reliability through configurable
 - **Exponential Backoff**: Failed inserts are retried with increasing delays
 - **Configurable Attempts**: Maximum retry attempts can be set via `retry.max_attempts` (default: 3)
 - **Smart Error Detection**: Only transient errors (rate limits, temporary server issues, network problems) are retried
+- **Partial-row handling**: On partial InsertAll failures, mysql2bq inspects per-row errors, automatically retries only the retryable rows, and ignores duplicate-insertId errors (treated as successful) to avoid unnecessary failures
 - **Graceful Degradation**: Non-retryable errors fail immediately to prevent data loss
 
 ### Configurations for batching and retry logic can be set in the configuration file
@@ -303,7 +320,177 @@ checkpoint:
   path: "/path/to/checkpoint.json"  # Checkpoint file location
 ```
 
+## One-time snapshot + binlog-catchup mode ("once")
+
+You can run a single-shot sync (snapshot the configured tables and then apply binlog events until caught up) using `mode: "once"` or the CLI flag `--mode once`.
+
+Behavior:
+
+- The pipeline captures a binlog/GTID start point, snapshots the configured tables into BigQuery, then streams binlog events from the captured start point until the position/GTID observed immediately after the snapshot is reached.
+- This "snapshot + catchup" workflow ensures the target table contains the snapshot state plus any intervening changes.
+
+Usage examples:
+
+```bash
+# Run one-time snapshot+catchup using config file
+./bin/mysql2bq start --config config.yaml --mode once
+```
+
+Configuration example:
+
+```yaml
+mode: "once"        # "continuous" (default) or "once"
+```
+
+Caveats & recommendations:
+
+- The implementation is designed for correctness but users should be aware of DB activity during snapshot. For high-write or large tables prefer a locking/consistent-snapshot strategy and validate results after the sync.
+
+- `insertId` is used to reduce duplicates, but consider application-level uniqueness or verification checksums for stricter guarantees.
+
+## Testing the one-time sync (validation)
+
+Follow these steps when validating a `mode: "once"` (snapshot + binlog-catchup) run.
+
+### Quick safety checklist
+
+- Backup or snapshot the target BigQuery table (or write to a test dataset).
+- Use a dedicated `checkpoint.path` for validation runs to avoid interfering with other checkpoint state.
+- Ensure the BigQuery service account / credentials are configured and have write access.
+- If possible, run first against a cloned dataset/table and validate rows/row counts before switching the target.
+
+### Example config — isolated / verification (smaller batches)
+
+```yaml
+mode: "once"
+mysql:
+  host: "example-mysql.local"
+  port: 3306
+  user: "replicator"
+  password: "secret"
+  server_id: 101
+bigquery:
+  project: "your-gcp-project"
+  dataset: "example_dataset"
+  service_account_key_json: "/secrets/gcp-key.json"
+cdc:
+  tables:
+    - db: "app_db"
+      table: "users"
+batching:
+  max_rows: 100                # smaller batches for visibility during validation
+retry:
+  max_attempts: 3
+  initial_delay: "1s"
+  max_delay: "10s"
+checkpoint:
+  type: "file"
+  path: "/var/lib/mysql2bq/checkpoint-once-example.json"   # isolated checkpoint
+http:
+  enabled: true
+  host: "0.0.0.0"
+  port: 9090
+  path: "/metrics"
+logging:
+  level: "debug"
+```
+
+### Example config — higher-throughput
+
+```yaml
+mode: "once"
+mysql:
+  host: "db.example.internal"
+  port: 3306
+  user: "replicator"
+  password: "REDACTED"
+  server_id: 201
+bigquery:
+  project: "your-gcp-project"
+  dataset: "target_dataset"
+  service_account_key_json: "/secrets/gcp-key.json"
+batching:
+  max_rows: 2000               # larger batches for throughput
+retry:
+  max_attempts: 5
+  initial_delay: "1s"
+  max_delay: "30s"
+checkpoint:
+  type: "file"
+  path: "/var/lib/mysql2bq/checkpoint-once-highthroughput.json"
+http:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8080
+logging:
+  level: "info"
+```
+
+### CLI & Docker examples
+
+- Run binary (uses config file; `--mode` overrides `config.Mode`):
+
+```bash
+./bin/mysql2bq start --config /etc/mysql2bq/config.once.yaml --mode once
+```
+
+- Run with Docker Compose (mount config + credentials into the container):
+
+```bash
+docker-compose run --rm -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcp-key.json mysql2bq start --config /etc/mysql2bq/config.docker.yaml --mode once
+```
+
+### What to watch while the job runs
+
+- Logs: look for these informational messages in order:
+  - `Snapshot start point captured` — snapshot start position recorded
+  - `Snapshot complete; will stream binlog events until ...` — stop point captured
+  - `Reached stop binlog position; completing one-time sync` or `Reached stop GTID set; completing one-time sync` — catchup complete
+  - `One-time sync completed successfully` — full run success
+- Metrics: poll the `GET /metrics` endpoint (if enabled) to monitor progress and error counters.
+- Checkpoint file: verify `checkpoint.path` shows the stop position/GTID after completion.
+
+### Post-run verification
+
+1. Compare row counts (and a few sample rows or checksums) between source DB and BigQuery target.
+2. Inspect BigQuery for duplicate rows (use a unique key in SQL or sample dedupe queries).
+3. Confirm checkpoint file has been updated to the stop position/GTID.
+4. Review logs for any non-retryable errors — address and re-run if needed.
+
+> Tip: run the `once` sync into a separate BigQuery dataset/table when validating changes — only switch production writes after verification.
+
+### Troubleshooting tips
+
+- GTID resume failed / GTIDs purged: the pipeline falls back to position-based start and logs a warning. Verify the checkpoint and re-run if needed.
+- Long-running snapshot: prefer using a consistent snapshot/backup method for very large tables to avoid long locks or heavy load.
+- Permanent row failures: check BigQuery insert error details (non-retryable rows will be reported) and fix schema/data issues before retrying.
+
 ## Usage
+
+### Seeder PoC (snapshot → stream)
+
+A proof-of-concept seeder command that demonstrates callback-based emission pattern inspired by Gravity's architecture.
+
+Run the seeder PoC:
+
+```bash
+# Run the seeder PoC using the main CLI
+./bin/mysql2bq seeder --config config.yaml
+```
+
+This demonstrates:
+
+- Callback-based row emission (Gravity-inspired pattern)
+- Mock table scanning with configurable tables
+- BigQuery integration ready for real data
+
+Notes:
+
+- Currently uses mock data for demonstration
+- Ready for integration with actual Gravity scanner
+- Will be evolved into full backfill command in Phase 2
+
+## Usage2
 
 Start the replication:
 
@@ -334,3 +521,23 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ✔ **Batch flush with retry logic for robust data transfer**
 ✔ **HTTP metrics endpoint for monitoring**
 ✔ **Asynchronous checkpointing for reliable binlog resume**
+✔ **Transaction-aware event buffering for data consistency**
+✔ **Schema auto-creation from MySQL table inspection**
+✔ **Worker pool with backpressure control for high-throughput processing**
+✔ **Advanced monitoring with BigQuery write metrics and transaction tracking**
+
+## Roadmap
+
+### Phase 1: Core Functionality ✅
+
+- ✅ MySQL snapshot scanning
+- ✅ Binlog streaming with GTID/position support
+- ✅ BigQuery writing with insertId for idempotency
+- ✅ Checkpointing for resumable operations
+- ✅ Basic metrics tracking
+
+### Phase 2: Reliability and Completeness ✅
+
+- ✅ Automatic GTID/position-based replication detection
+- ✅ Checkpoint store interface with GTID and position support
+- ✅ Improved CDC reliability foundations (retry logic, error handling)
